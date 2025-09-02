@@ -4,34 +4,20 @@ from typing import TypeVar
 from torch.nn import functional as F
 from copy import deepcopy
 import numpy as np
-
-import data_config
+import config
 
 Tensor = TypeVar('torch.tensor')
-
-class IMCLNet(nn.Module):
-    def __init__(self, predictor):
-        super(IMCLNet, self).__init__()
-        self.predictor = predictor
-        self.coefficient = torch.nn.Parameter(data_config.label_graph_norm_empty_diag)
-
-    def forward(self, inputs):
-        x = self.predictor(inputs)
-        outputs = x
-
-
 
 class CorrelateEncoderDecoder(nn.Module):
     def __init__(self, encoder, decoder, noise_flag=False, fix_source=False):
         super(CorrelateEncoderDecoder, self).__init__()
         self.encoder = encoder
+        self.decoder = decoder
         if fix_source == True:
             for p in self.parameters():
                 p.requires_grad = False
                 print("Layer weight is freezed:",format(p.shape))
-        self.decoder = decoder
         self.noise_flag = noise_flag
-
 
     def forward(self, inputs: Tensor) -> Tensor:
         if self.noise_flag:
@@ -66,27 +52,102 @@ class CorrelateMLP(nn.Module):
             modules.append(
                 nn.Sequential(
                     nn.Linear(hidden_dims[i], hidden_dims[i + 1], bias=True),
-                    #nn.BatchNorm1d(hidden_dims[i + 1]),
+                    nn.BatchNorm1d(hidden_dims[i + 1]),
                     act_fn(),
                     nn.Dropout(self.drop))
             )
         self.module = nn.Sequential(*modules)
         self.output_layer = nn.Sequential(nn.Linear(hidden_dims[-1], output_dim, bias=True))
-        self.coefficient = torch.nn.Parameter(torch.from_numpy(data_config.label_graph_norm_empty_diag).float())
+        self.coefficient = torch.nn.Parameter(torch.from_numpy(config.label_graph_diag).float())
 
     def forward(self, inputs):
         embed = self.module(inputs)
         output = self.output_layer(embed)
+        
         diag = torch.diag(self.coefficient)
         c_diag = torch.diag_embed(diag)
         output = output + torch.mm(output, self.coefficient - c_diag)
         return output
 
+class LabelDependencySmoothing(nn.Module):
+    def __init__(self, label_graph, k_alpha=10, lambda_smooth=0.1, device='cuda'):
+        super().__init__()
+        self.k_alpha = k_alpha
+        self.lambda_smooth = lambda_smooth
+        self.num_labels = label_graph.shape[0]
+        
+        # 构建稀疏邻接矩阵
+        self.adj_matrix = self._build_adjacency_matrix(label_graph)
+        self.adj_matrix = torch.tensor(self.adj_matrix, dtype=torch.float).to(device)
+        
+        # 可学习的连接权重
+        self.edge_weights = nn.Parameter(torch.ones(self.adj_matrix.nonzero().size(0)))
+        
+    def _build_adjacency_matrix(self, label_graph):
+        """构建k-最近邻的邻接矩阵"""
+        adj_matrix = np.zeros((self.num_labels, self.num_labels))
+        
+        for i in range(self.num_labels):
+            # 获取当前标签最相关的k_alpha个标签
+            # 排除自身 (co-occurrence rate=1)
+            all_indices = np.arange(len(label_graph[i]))
+            # 排除自身索引
+            other_indices = all_indices[all_indices != i]
+            # 选择相关性最高的k_alpha个标签
+            neighbors = other_indices[np.argsort(label_graph[i][other_indices])[-self.k_alpha:]]
+            
+            for j in neighbors:
+                adj_matrix[i, j] = 1.0  # 创建无向边
+                adj_matrix[j, i] = 1.0
+        
+        return adj_matrix
 
-
-
-
-
+    def forward(self, logits, labels):
+        """
+        修正：根据图片中的公式(3)正确使用labels参数
+        y_{j,i} = { 
+            y_{j,i}^o,  if j ∈ Ω_i (有标注标签)
+            2p_{j,i}-1, if j ∉ Ω_i (无标注标签)
+        }
+        """
+        # 1. 使用sigmoid获取预测概率
+        y_prob = torch.sigmoid(logits)
+        
+        # 2. 根据公式(3)构建y_converted:
+        #   - 有标注标签: 使用真实标签
+        #   - 无标注标签: 使用预测概率
+        # 这里假设labels值域为[0,1]，将其变换为[-1,1]区间
+        y_label_transformed = 2 * labels - 1
+        
+        # 3. 区分有标注标签和预测标签
+        # 在实际应用中，可以通过mask或有效标签标记，但根据图片描述
+        # 我们假设标注可见性通过Ω_i隐式表示在标签值中
+        # 这里简单假设: 当label不是0或1时，表示该标签无标注
+        has_annotation = (labels == 0) | (labels == 1)
+        y_converted = torch.where(has_annotation, 
+                                 y_label_transformed, 
+                                 2 * y_prob - 1)
+        
+        # 4. 获取邻接矩阵中的边索引
+        rows, cols = self.adj_matrix.nonzero(as_tuple=False).T
+        edge_ids = torch.stack([rows, cols], dim=1)
+        
+        # 5. 提取连接的标签对
+        left_labels = edge_ids[:, 0]
+        right_labels = edge_ids[:, 1]
+        
+        # 6. 计算标签对之间的差异
+        y_left = y_converted[:, left_labels] 
+        y_right = y_converted[:, right_labels] 
+        diff = y_left - y_right
+        
+        # 7. 加权平滑损失计算
+        edge_loss = self.edge_weights.unsqueeze(0) * (diff ** 2)  # (batch_size, num_edges)
+        total_loss = torch.mean(edge_loss)
+        
+        return self.lambda_smooth * total_loss
+    
+    
 class MLP(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dims=None, drop=0.1, act_fn=nn.SELU, **kwargs):
         super(MLP, self).__init__()
@@ -112,8 +173,6 @@ class MLP(nn.Module):
         embed = self.module(inputs)
         output = self.output_layer(embed)
         return output
-
-
 
 
 class EncoderDecoder(nn.Module):
@@ -147,7 +206,7 @@ class EncoderDecoder(nn.Module):
 
 
 def calc_coeff(iter_num, high=1.0, low=0.0, alpha=10.0, max_iter=10000.0):
-    return np.float(2.0 * (high - low) / (1.0 + np.exp(-alpha*iter_num / max_iter)) - (high - low) + low)
+    return np.float32(2.0 * (high - low) / (1.0 + np.exp(-alpha*iter_num / max_iter)) - (high - low) + low)
 
 def init_weights(m):
     classname = m.__class__.__name__
@@ -208,6 +267,7 @@ def grl_hook(coeff):
         return -coeff*grad.clone()
     return fun1
 
+
 class HDA(nn.Module):
   def __init__(self, encoder, classifier, new_cls=True, hiden_dim=64, heuristic_num=1, heuristic_initial=False):
     super(HDA, self).__init__()
@@ -267,11 +327,8 @@ class HDA(nn.Module):
     if heuristic:
         y = y - geuristic
 
-    # print("y=================")
-    # print(y)
     out = self.classifier(y)
-    # print("out===============")
-    # print(out)
+
     return x, y, geuristic, out.squeeze(dim=1)
 
   def output_num(self):

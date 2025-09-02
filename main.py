@@ -4,11 +4,10 @@ import torch
 import json
 import os
 import argparse
-import pickle
 from collections import defaultdict
 import itertools
 import data
-import data_config
+import config
 import pretraining, training_classifier, domain_training
 from copy import deepcopy
 import time
@@ -28,11 +27,12 @@ def dict_to_str(d):
 def main(args, drug, params_dict):
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     #load mix gene expressions for both 9000 tcga and 1000 cell line
-    gex_features_df = pd.read_csv(data_config.gex_feature_file, index_col=0)
+    gex_features_df = pd.read_csv(config.gex_feature_file, index_col=0)
     #load traning params
     with open(os.path.join('train_params.json'), 'r') as f:
         training_params = json.load(f)
     training_params['unlabeled'].update(params_dict)
+    training_params['labeled'].update(params_dict)
     param_str = dict_to_str(params_dict)
     method_save_folder = os.path.join('model_save')
 
@@ -61,11 +61,6 @@ def main(args, drug, params_dict):
         days_threshold_list=args.days_thres,
         n_splits=args.n)
 
-    with open("{}_auroc.txt".format(param_str), 'a') as opf:
-        opf.write(param_str)
-        opf.write('\n')
-    opf.close()
-
     # start unlabeled training, obtain target shared encoder
     encoder = pretraining.training(s_dataloaders=s_dataloaders,
                                    t_dataloaders=t_dataloaders,
@@ -73,7 +68,8 @@ def main(args, drug, params_dict):
                                                  type='unlabeled'))
    
     fold = 0
-    for train_labeled_ccle, test_labeled_ccle, labeled_tcga in labeled_dataloader:            
+    all_results = []
+    for train_labeled_ccle, test_labeled_ccle, labeled_tcga in labeled_dataloader:          
         ft_encoder = deepcopy(encoder)
         print('--------------------', drug)
         print('Cline training samples:', train_labeled_ccle.dataset.tensors[1].shape)
@@ -83,32 +79,35 @@ def main(args, drug, params_dict):
                                             encoder=ft_encoder,
                                             train_dataloader=train_labeled_ccle,
                                             val_dataloader=test_labeled_ccle,
-                                            task_save_folder=task_save_folder,
                                             drug=drug,
                                             **wrap_params(training_params, type='labeled'))
 
         classifier.load_state_dict(torch.load(os.path.join(os.path.join(method_save_folder, param_str), 'predictor.pt')))
         start_time = time.time()
+        print('------domain adaption--------------')
         network, results = domain_training.training(encoder=ft_encoder,
                                            classifier=classifier,
                                            s_dataloader=train_labeled_ccle,
                                            t_dataloader=labeled_tcga,
                                            drug=drug,
-                                           task_save_folder=task_save_folder,
-                                           params_str=param_str,
-                                           **wrap_params(training_params, type='labeled'))
+                                           **wrap_params(training_params))
+        
         results = pd.DataFrame(results)
+        results.columns = drug; results.index = ['auc','aupr','f1','acc']
         elapsed = time.time() - start_time
         print('8-drug Elapsed time: ', round(elapsed, 4))
         with open(f'results/{fold}/{param_str}', 'w') as f:
-            results.to_csv(f)
-            
+            results.to_csv(f)           
         fold = fold+1
-        
-    with open("{}_auroc.txt".format(param_str), 'a') as opf:
-        opf.write('\n')
-        opf.write('\n')
-    opf.close()
+        all_results.append(results)
+
+    # Calculate the average result of 5-CV    
+    avg_result = np.mean(np.array(all_results), 0)  
+    avg_result = pd.DataFrame(avg_result)
+    avg_result.columns = drug; avg_result.index = ['auc','aupr','f1','acc']
+    file_name = os.path.join('results', param_str)
+    with open(f'{file_name}.csv', 'w') as f:
+        avg_result.to_csv(f)      
 
 
 if __name__ == '__main__':
@@ -131,15 +130,15 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     params_grid = {
-        "pretrain_num_epochs": [300],
+        "pretrain_num_epochs": [100, 200, 300, 400],
+        "train_num_epochs": [100, 200, 300, 400],
+        "drop": [0.1, 0.2, 0.3]
     }
 
     keys, values = zip(*params_grid.items())
     params_list = [dict(zip(keys, v)) for v in itertools.product(*values)]
 
     for param in params_list:
-        
         main(args=args, params_dict=param,
-             # drug=["Cisplatin", "Paclitaxel", "Cyclophosphamide", "Doxorubicin", "5-Fluorouracil"])
              drug=["Cisplatin", "Paclitaxel", "Cyclophosphamide", "Doxorubicin", "5-Fluorouracil", "Gemcitabine",
                    "Docetaxel", "Etoposide"])
