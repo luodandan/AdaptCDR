@@ -213,7 +213,7 @@ def get_ccle_multi_labeled_dataloader_generator(gex_features_df, batch_size, dru
         config.label_graph_norm[:, idx_col] = config.label_graph_norm[:, idx_col] * 1.0 / normalizer
     
     print("Normalizered Label Graph============================================================")
-    threshold_label = 0.1
+    threshold_label = 0.13
     config.label_graph_diag = config.label_graph_norm - np.diag(np.diag(config.label_graph_norm))
     config.label_graph_diag = (config.label_graph_diag >= threshold_label).astype(int)
     print(config.label_graph_diag)
