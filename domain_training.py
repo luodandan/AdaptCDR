@@ -23,7 +23,7 @@ def multi_eval_epoch(epoch, model, loader, device):
     with torch.no_grad():
         for x, y in loader:
             x = x.to(device)
-            y_orig = y   # 原始 -1/0/1 (CPU)
+            y_orig = y 
             mask = (y_orig != 0).to(device)   # bool mask (batch, n_tasks)
             y_mapped = ((y_orig + 1.0) / 2.0).to(device).double()  # -1/1 -> 0/1 (0 -> 0.5 but masked)
             *_, yp = model(x)
@@ -36,7 +36,6 @@ def multi_eval_epoch(epoch, model, loader, device):
 
     avg_loss_like_original = total_loss_sum / len(loader)
 
-    # 合并所有 batch
     y_true = np.concatenate(y_trues, axis=0)   # (N, n_tasks)
     y_pred = np.concatenate(y_preds, axis=0)   # logits (N, n_tasks)
     y_mask = np.concatenate(y_masks, axis=0)   # bool (N, n_tasks)
